@@ -442,6 +442,31 @@ def main():
           session.overlay.text.get("1.0", "end").strip() == "你好，世",
           repr(session.overlay.text.get("1.0", "end").strip()))
 
+    # ---- 第二遍的润色结果不能盖掉已经翻页的当前句 ----
+    # 第二遍比第一遍慢,这一句的润色完全可能在下一句显示之后才回来。
+    session._last_source = "第二句原文"
+    session._last_translation = "第二句译文"
+    session.repaint()                      # 让悬浮窗真的显示上第二句
+    pump(root, 0.2)
+    session._handle("refined", ("第一句原文", "第一句润色后的译文", "stub"))
+    pump(root, 0.2)
+    check("已经翻页后,过期的润色结果会被丢掉",
+          session._last_translation == "第二句译文",
+          repr(session._last_translation))
+    check("过期的润色也不会画到悬浮窗上",
+          session.overlay.text.get("1.0", "end").strip() == "第二句译文",
+          repr(session.overlay.text.get("1.0", "end").strip()))
+
+    # 同一句的润色结果则应该被采纳
+    session._handle("refined", ("第二句原文", "第二句润色版", "stub"))
+    pump(root, 0.2)
+    check("同一句的润色结果会被采纳",
+          session._last_translation == "第二句润色版",
+          repr(session._last_translation))
+    check("采纳后悬浮窗同步更新",
+          session.overlay.text.get("1.0", "end").strip() == "第二句润色版",
+          repr(session.overlay.text.get("1.0", "end").strip()))
+
     # ---- 上下文缓冲(第二遍翻译的依据)----
     session._reset_context()
     for ln in ("line one", "line two", "line three", "line four", "line five"):

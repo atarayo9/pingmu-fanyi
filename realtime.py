@@ -1267,8 +1267,14 @@ class RealtimeSession:
             if was_streaming:
                 self._text_stamp = time.time()
         elif kind == "refined":
-            # 第二遍(带上下文)的结果回来了,悄悄替换掉
+            # 第二遍(带上下文)的结果回来了。
+            #
+            # 必须先确认屏幕还停在**同一句**上再替换:第二遍本来就比第一遍慢,
+            # 这一句的润色结果完全可能在下一句已经显示之后才回来 —— 那样就会把
+            # 下一句的译文覆盖成本句的,用户看到一句驴唇不对马嘴的话。
             text, out, used = payload
+            if text != self._last_source:
+                return                      # 屏幕已经翻页了,这份润色作废
             if self._last_translation == out:
                 return
             self._last_translation = out
