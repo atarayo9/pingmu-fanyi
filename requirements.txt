@@ -1,0 +1,5 @@
+pillow>=10.0
+requests>=2.31
+pyperclip>=1.8
+keyboard>=0.13
+rapidocr_onnxruntime>=1.3
