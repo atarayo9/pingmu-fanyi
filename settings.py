@@ -446,6 +446,29 @@ class SettingsWindow(tk.Toplevel):
         ttk.Checkbutton(page, text="逐字显示(译文边生成边出现,感觉更快)",
                         variable=self.rt_stream_var,
                         style="Card.TCheckbutton").pack(anchor="w", pady=(6, 0))
+
+        ctxbox = tk.Frame(page, bg=CARD)
+        ctxbox.pack(fill="x", pady=(8, 0))
+        tk.Label(ctxbox, text="前文最多带多少字", bg=CARD, fg=MUTED, anchor="w",
+                 font=(FONT, 8)).pack(fill="x")
+        _cc_line = tk.Frame(ctxbox, bg=CARD)
+        _cc_line.pack(fill="x")
+        try:
+            _cc = int(self.cfg.get("rt_context_chars", 500) or 500)
+        except (TypeError, ValueError):
+            _cc = 500
+        self.rt_ctx_chars_var = tk.DoubleVar(value=_cc)
+        _cc_lbl = tk.Label(_cc_line, text=f"{_cc} 字", bg=CARD, fg=TEXT,
+                           width=8, anchor="w", font=(FONT, 9, "bold"))
+        ttk.Scale(_cc_line, from_=100, to=2000, variable=self.rt_ctx_chars_var,
+                  length=250,
+                  command=lambda _v: _cc_lbl.configure(
+                      text=f"{int(self.rt_ctx_chars_var.get())} 字")).pack(
+            side="left")
+        _cc_lbl.pack(side="left", padx=8)
+        hint(page, "前文每翻一句都要重发一次,所以按字数封顶。调大更连贯,但更慢也更费;"
+                   "看字幕 300~500 够用,翻长文章可以调到 1000 左右。")
+
         _spec = engines.get_engine(self.cfg.get("engine", ""))
         if _spec and _spec.supports_context:
             _tip, _color = (f"{_spec.name} 支持上下文,这两个开关直接生效。",
@@ -596,6 +619,7 @@ class SettingsWindow(tk.Toplevel):
         self.cfg["rt_show_region"] = bool(self.rt_region_var.get())
         self.cfg["rt_context"] = bool(self.rt_context_var.get())
         self.cfg["rt_stream"] = bool(self.rt_stream_var.get())
+        self.cfg["rt_context_chars"] = int(self.rt_ctx_chars_var.get())
         self.cfg["rt_show_source"] = bool(self.rt_source_var.get())
         self.cfg["rt_topmost"] = bool(self.rt_topmost_var.get())
         self.cfg["rt_merge_lines"] = bool(self.rt_merge_var.get())

@@ -1035,26 +1035,57 @@ class RealtimeSession:
     # ------------------------------------------------------ 后台线程
 
     # ---- 上下文:翻译过的前几句,用来帮大模型判断指代、称呼、专有名词 ----
+    #
+    # 上下文是**每一句都要重发一遍**的,所以必须限死,不然会一路涨上去:
+    # 框一大片文字时,一次 OCR 就可能出来一万多字,全塞进前文的话
+    # 每翻一句都要多花几千 token,又慢又贵 —— 正好毁掉"秒出"。
+    #
+    # 所以两道闸一起卡:
+    #   1) 条数 rt_context_lines —— 只留最近几句;
+    #   2) 字数 rt_context_chars —— 真正管住成本的是这道。
+    # 超预算时从**最旧的那句**开始砍,而且保留它的**结尾**部分 ——
+    # 离当前这句最近的内容才最有用。
 
     def _context_text(self):
         """把最近几句拼成前文。只取原文,不带译文 —— 带上译文反而容易串味。"""
         n = int(self.cfg.get("rt_context_lines", 4) or 0)
-        if n <= 0:
+        budget = int(self.cfg.get("rt_context_chars", 500) or 0)
+        if n <= 0 or budget <= 0:
             return ""
-        items = self._context[-n:]
-        if not items:
-            return ""
-        return "\n".join(items)
+        picked, used = [], 0
+        # 从最近的一句往回捡,捡满预算就停
+        for line in reversed(self._context[-n:]):
+            line = line.strip()
+            if not line:
+                continue
+            room = budget - used
+            if room <= 0:
+                break
+            if len(line) <= room:
+                picked.append(line)
+                used += len(line) + 1          # +1 是拼回去时的换行
+            else:
+                # 这句太长:只留结尾一段(紧挨着当前这句的部分)
+                picked.append(line[-room:])
+                used = budget
+                break
+        picked.reverse()
+        return "\n".join(picked)
 
     def _push_context(self, source):
-        """把一句原文记进上下文;太长的截断,重复的不记。"""
+        """把一句原文记进上下文。超长的截断,重复的丢掉。"""
         s = (source or "").strip()
         if not s:
             return
+        # 单条也别留太长:缓冲是给下一句当前文用的,留结尾就够了
+        cap = max(int(self.cfg.get("rt_context_chars", 500) or 500), 100)
+        if len(s) > cap:
+            s = s[-cap:]
         if self._context and self._context[-1] == s:
             return
         self._context.append(s)
         limit = max(int(self.cfg.get("rt_context_lines", 4) or 4), 1)
+        # 条数是粗筛,真正的上限由 _context_text 的字数预算决定
         del self._context[:-limit * 2]
 
     def _engine_supports_context(self):

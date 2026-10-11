@@ -97,7 +97,8 @@ DEFAULT_CONFIG = {
     "rt_show_region": True,        # 在屏幕上画出监视范围框(看得见在翻哪一块)
     "rt_region_color": "#2f6fed",  # 范围框颜色
     "rt_context": True,            # 联系上下文翻译(只对大模型引擎生效)
-    "rt_context_lines": 4,         # 上下文带回前面几行
+    "rt_context_lines": 4,         # 上下文最多带回前面几行
+    "rt_context_chars": 500,       # 上下文总字数上限(真正管住成本的是这个)
     "rt_settle_ms": 900,           # 文本稳定多久后做上下文重译
     "rt_stream": True,             # 大模型引擎流式输出(边生成边显示)
     "rt_auto_start": False,        # 记住范围后,下次直接开始

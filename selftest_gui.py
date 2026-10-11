@@ -457,6 +457,49 @@ def main():
     session._reset_context()
     check("重置后上下文为空", session._context_text() == "")
 
+    # ---- 上下文必须按字数封顶(前文每句都要重发,不封顶会一路涨上去)----
+    session._reset_context()
+    session.cfg["rt_context_lines"] = 4
+    session.cfg["rt_context_chars"] = 200
+    for i in range(4):
+        session._push_context("P" * 300)          # 每句都超预算
+    ctx = session._context_text()
+    check("超长文本不会撑爆上下文", len(ctx) <= 210, f"{len(ctx)} 字符")
+
+    session._reset_context()
+    session.cfg["rt_context_lines"] = 4
+    session.cfg["rt_context_chars"] = 120
+    for i in range(4):
+        session._push_context(f"line{i}-" + "x" * 40)   # 每句约 46 字
+    ctx = session._context_text()
+    check("上下文总字数不超预算", len(ctx) <= 130, f"{len(ctx)} 字符")
+    check("超预算时丢掉的是最旧的,保留最近的",
+          "line3" in ctx and "line0" not in ctx, repr(ctx[:60]))
+    check("保留的仍然分得清句", ctx.count("\n") >= 1, repr(ctx[:60]))
+
+    # 单条也要截断,否则缓冲里会存着一整屏文字
+    session._reset_context()
+    session.cfg["rt_context_chars"] = 100
+    session._push_context("Z" * 5000)
+    check("单条超长文本会被截断后才存",
+          sum(len(x) for x in session._context) <= 100,
+          f"缓冲占用 {sum(len(x) for x in session._context)} 字符")
+    check("截断保留的是结尾(离当前这句最近)",
+          session._context and session._context[-1].endswith("Z"))
+
+    # 标题级的短语料不能被封顶影响
+    session._reset_context()
+    session.cfg["rt_context_chars"] = 500
+    for ln in ("Commander, the scouts have returned.",
+               "Tell them to report to me at once."):
+        session._push_context(ln)
+    check("正常字幕前文完整保留",
+          "Commander" in session._context_text()
+          and "report" in session._context_text(),
+          repr(session._context_text()))
+
+    session._reset_context()
+
     # ---- 第二遍重译:必须等文本稳定,而且只做一次 ----
     session.cfg["engine"] = "deepseek"          # 只有大模型引擎读得懂前文
     session.cfg["rt_context"] = True
