@@ -96,6 +96,10 @@ DEFAULT_CONFIG = {
     "rt_merge_lines": True,        # 折行合并后再翻译
     "rt_show_region": True,        # 在屏幕上画出监视范围框(看得见在翻哪一块)
     "rt_region_color": "#2f6fed",  # 范围框颜色
+    "rt_context": True,            # 联系上下文翻译(只对大模型引擎生效)
+    "rt_context_lines": 4,         # 上下文带回前面几行
+    "rt_settle_ms": 900,           # 文本稳定多久后做上下文重译
+    "rt_stream": True,             # 大模型引擎流式输出(边生成边显示)
     "rt_auto_start": False,        # 记住范围后,下次直接开始
 }
 DEFAULT_CONFIG.update(_ENGINE_DEFAULTS)
@@ -404,6 +408,40 @@ def _rapid_ocr(img):
 # 下面用「行投影」自己把它切成一行一行,再逐行识别。
 _RAPID_MAX_RATIO = 8.0
 
+# 文字行太扁时,上下补一点背景,把宽高比压下来。
+#
+# 识别模型会把图缩放到高 48 再认字。行裁剪出来的图往往很扁(宽高比能到 40+),
+# 模型就得把它拉成超宽的输入,实测会把**词间空格丢掉**
+# (`The old man` 变成 `Theoldman`),翻译质量跟着受影响。
+# 补一点背景能保住空格。但补过头字就太小了(补到 48 以上开始认错字),
+# 所以只动很扁的行,而且最多补到行高的两倍。
+_ROW_PAD_TRIGGER = 24      # 行高小于这个值才补
+_ROW_PAD_TARGET = 32       # 补到这个高度
+
+
+def _pad_row(img):
+    """行太扁就上下补点背景。背景色取图像上下边缘的中位色,免得补出突兀的色块。"""
+    w, h = img.size
+    if h >= _ROW_PAD_TRIGGER:
+        return img
+    target = int(min(_ROW_PAD_TARGET, h * 2))
+    if h >= target:
+        return img
+    try:
+        import numpy as np
+        a = np.asarray(img.convert("RGB"))
+        edge = np.concatenate([a[0:1].reshape(-1, 3), a[-1:].reshape(-1, 3)])
+        bg = tuple(int(v) for v in np.median(edge, axis=0))
+    except Exception:
+        bg = (0, 0, 0)
+    try:
+        from PIL import Image
+        canvas = Image.new("RGB", (w, target), bg)
+        canvas.paste(img, (0, (target - h) // 2))
+        return canvas
+    except Exception:
+        return img
+
 
 def _text_rows(img, min_h=6, pad=2):
     """按横向投影把图切成若干「文字行」,返回 PIL 图列表。
@@ -461,10 +499,14 @@ def _rapid_ocr_smart(img):
     ratio = (w / h) if h else 0.0
     rows = None
 
+    def _rows_text(rs):
+        return "\n".join(t for t in (_rapid_ocr(_pad_row(r)) for r in rs)
+                         if t.strip())
+
     if ratio > _RAPID_MAX_RATIO:
         rows = _text_rows(img)
         if rows:
-            text = "\n".join(t for t in (_rapid_ocr(r) for r in rows) if t.strip())
+            text = _rows_text(rows)
             if text.strip():
                 return text
 
@@ -476,7 +518,7 @@ def _rapid_ocr_smart(img):
     if rows is None:
         rows = _text_rows(img)
     if rows:
-        return "\n".join(t for t in (_rapid_ocr(r) for r in rows) if t.strip())
+        return _rows_text(rows)
     return ""
 
 

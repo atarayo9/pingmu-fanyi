@@ -579,6 +579,28 @@ class StylePanel(tk.Toplevel):
                                                   columnspan=3, sticky="w")
         r += 1
 
+        # ---- 上下文与速度 ----
+        r = section("上下文与速度", r)
+        self.ctx_var = tk.BooleanVar(value=bool(self.cfg.get("rt_context", True)))
+        ttk.Checkbutton(body, text="联系上下文翻译(看对话/长文时更连贯)",
+                        variable=self.ctx_var, style="Card.TCheckbutton",
+                        command=self._apply).grid(row=r, column=0,
+                                                  columnspan=3, sticky="w")
+        r += 1
+        self.stream_var = tk.BooleanVar(value=bool(self.cfg.get("rt_stream", True)))
+        ttk.Checkbutton(body, text="逐字显示(译文边生成边出现,感觉更快)",
+                        variable=self.stream_var, style="Card.TCheckbutton",
+                        command=self._apply).grid(row=r, column=0,
+                                                  columnspan=3, sticky="w")
+        r += 1
+        self.ctx_tip = tk.Label(body, text="", bg=theme.CARD, fg=theme.MUTED,
+                                font=(FONT, 8), anchor="w", wraplength=310,
+                                justify="left")
+        self.ctx_tip.grid(row=r, column=0, columnspan=3, sticky="w",
+                          pady=(2, 0))
+        r += 1
+        self._refresh_ctx_tip()
+
         # ---- 性能 ----
         r = section("性能", r)
         self.interval_var, r = slider(
@@ -604,6 +626,22 @@ class StylePanel(tk.Toplevel):
 
     # ------------------------------------------------------ 内部
 
+    def _refresh_ctx_tip(self):
+        """提示当前引擎支不支持上下文和流式 —— 只对大模型引擎有效。"""
+        spec = engines.get_engine(self.cfg.get("engine", ""))
+        name = spec.name if spec else "当前引擎"
+        if spec and spec.supports_context:
+            txt = f"{name} 支持上下文,开关直接生效。"
+            color = theme.MUTED
+        else:
+            txt = (f"{name} 读不懂前文,这两个开关对它无效 —— "
+                   f"想用请把引擎换成 DeepSeek 或 OpenAI 兼容接口。")
+            color = theme.WARN
+        try:
+            self.ctx_tip.configure(text=txt, fg=color)
+        except Exception:
+            pass
+
     def _refresh_color_buttons(self):
         fg = str(self.cfg.get("rt_fg", "#ffffff"))
         bg = str(self.cfg.get("rt_bg", "#0f1318"))
@@ -621,6 +659,8 @@ class StylePanel(tk.Toplevel):
         self.cfg["rt_show_source"] = bool(self.source_var.get())
         self.cfg["rt_topmost"] = bool(self.topmost_var.get())
         self.cfg["rt_merge_lines"] = bool(self.merge_var.get())
+        self.cfg["rt_context"] = bool(self.ctx_var.get())
+        self.cfg["rt_stream"] = bool(self.stream_var.get())
         if bool(self.ct_var.get()) != self.session.overlay.click_through:
             self.session.set_click_through(bool(self.ct_var.get()))
         self.cfg["rt_click_through"] = bool(self.ct_var.get())
@@ -708,6 +748,13 @@ class RealtimeSession:
         self._fails = 0
         self._last_ok = 0.0
 
+        # ---- 上下文翻译 ----
+        self._context = []                # 最近几句原文,给大模型当前文
+        self._ctx_pending = None          # 等着做上下文重译的那句
+        self._text_stamp = 0.0            # 原文最后一次变化的时间
+        self._ctx_busy = False
+        self._streaming = False           # 正在流式接收
+
     # ------------------------------------------------------ 生命周期
 
     def start(self, region):
@@ -719,6 +766,7 @@ class RealtimeSession:
         self._last_source = ""
         self._last_translation = ""
         self._fails = 0
+        self._reset_context()
 
         if self.overlay is None or not self.overlay.winfo_exists():
             self.overlay = RealtimeOverlay(self.master, self)
@@ -863,6 +911,7 @@ class RealtimeSession:
             self._last_sig = None
             self._last_source = ""
             self._last_translation = ""
+            self._reset_context()          # 换了范围,前文不作数了
             if self.overlay and self.overlay.winfo_exists():
                 self.overlay.place_near_region()
                 self.overlay.set_status("已切换范围,正在识别…", "#3ddc84")
@@ -928,6 +977,7 @@ class RealtimeSession:
             return
         try:
             self._drain_results()
+            self._maybe_refine()
             if self.overlay and self.overlay.winfo_exists() and \
                     core.rect_intersects(self.region, self._overlay_rect()):
                 # 悬浮窗压在采集区上,先把它变透明再截图,免得把译文自己认进去
@@ -984,6 +1034,75 @@ class RealtimeSession:
 
     # ------------------------------------------------------ 后台线程
 
+    # ---- 上下文:翻译过的前几句,用来帮大模型判断指代、称呼、专有名词 ----
+
+    def _context_text(self):
+        """把最近几句拼成前文。只取原文,不带译文 —— 带上译文反而容易串味。"""
+        n = int(self.cfg.get("rt_context_lines", 4) or 0)
+        if n <= 0:
+            return ""
+        items = self._context[-n:]
+        if not items:
+            return ""
+        return "\n".join(items)
+
+    def _push_context(self, source):
+        """把一句原文记进上下文;太长的截断,重复的不记。"""
+        s = (source or "").strip()
+        if not s:
+            return
+        if self._context and self._context[-1] == s:
+            return
+        self._context.append(s)
+        limit = max(int(self.cfg.get("rt_context_lines", 4) or 4), 1)
+        del self._context[:-limit * 2]
+
+    def _engine_supports_context(self):
+        spec = engines.get_engine(self.cfg.get("engine", ""))
+        return bool(spec and spec.supports_context)
+
+    def _engine_supports_stream(self):
+        spec = engines.get_engine(self.cfg.get("engine", ""))
+        return bool(spec and spec.supports_stream)
+
+    def _reset_context(self):
+        """清空上下文(开始 / 换范围 / 退出时调用)。"""
+        self._context = []
+        self._ctx_pending = None
+        self._text_stamp = 0.0
+        self._ctx_busy = False
+        self._streaming = False
+
+    def _maybe_refine(self):
+        """文本稳定一会儿之后,带前文重译一次。
+
+        这是第二遍:第一遍已经立刻出结果了,这一遍只是让译文更贴上下文,
+        所以慢一点没关系,也不会让界面空着。同一句只做一次。
+        """
+        if not self.cfg.get("rt_context", True):
+            return
+        if self._ctx_pending is None or self._ctx_busy or self._busy:
+            return
+        if not self._engine_supports_context():
+            return
+        settle = int(self.cfg.get("rt_settle_ms", 900) or 900) / 1000.0
+        if time.time() - self._text_stamp < settle:
+            return
+        text = self._ctx_pending
+        self._ctx_pending = None
+        ctx = self._context_text()
+        if not ctx:
+            return
+        self._ctx_busy = True
+        threading.Thread(target=self._refine_thread, args=(text, ctx),
+                         daemon=True).start()
+
+    def _refine_thread(self, text, ctx):
+        try:
+            self._worker_context(text, ctx)
+        finally:
+            self._ctx_busy = False
+
     def _worker(self, img):
         try:
             raw = core.ocr_image(img, self.cfg.get("ocr_lang", "auto"),
@@ -1011,12 +1130,32 @@ class RealtimeSession:
             cached = self.cache.get(key)
             if cached is not None:
                 self._results.put(("ok", (text, cached, engine_id, True)))
+                self._text_stamp = time.time()
                 return
 
+            # ---- 第一遍:立刻翻,不等上下文,保证"秒出" ----
+            # 大模型引擎顺便开流式,边生成边显示
+            stream = bool(self.cfg.get("rt_stream", True)) and \
+                self._engine_supports_stream()
+            on_delta = None
+            if stream:
+                def on_delta(acc, _t=text):
+                    self._results.put(("delta", (acc, _t)))
+
             out, used = engines.translate(text, self.cfg, engine_id,
-                                          allow_fallback=True)
+                                          allow_fallback=True,
+                                          on_delta=on_delta)
             self.cache.put(key, out)
             self._results.put(("ok", (text, out, used, False)))
+            self._text_stamp = time.time()
+
+            # ---- 第二遍:等这句话稳定下来,带上前文重译一次 ----
+            # 只有大模型引擎读得懂前文;而且必须等前文已经攒够,
+            # 否则第一句就用不上上下文,白跑一趟
+            if self.cfg.get("rt_context", True) \
+                    and self._engine_supports_context() \
+                    and self._context:
+                self._ctx_pending = text
 
         except engines.MissingKeyError as e:
             self._results.put(("needkey", e))
@@ -1028,7 +1167,24 @@ class RealtimeSession:
             log.exception("实时翻译后台出错")
             self._results.put(("error", f"{type(e).__name__}: {e}"))
         finally:
+            # 必须无条件清掉,否则主循环会一直以为后台还在忙,
+            # 结果队列再也没人处理 —— 整个实时翻译就卡死了
             self._busy = False
+
+    def _worker_context(self, text, context):
+        """带前文重译。译文和第一遍一样就什么都不做。"""
+        try:
+            out, used = engines.translate(text, self.cfg,
+                                          self.cfg.get("engine"),
+                                          allow_fallback=True,
+                                          context=context)
+            if not out or not out.strip():
+                return
+            out = out.strip()
+            if out != self._last_translation:
+                self._results.put(("refined", (text, out, used)))
+        except Exception as e:
+            log.info("上下文重译失败(忽略): %s", e)
 
     # ------------------------------------------------------ 结果回填
 
@@ -1051,10 +1207,22 @@ class RealtimeSession:
         o = self.overlay
         if not o or not o.winfo_exists():
             return
-        if kind == "ok":
+        if kind == "delta":
+            # 流式:大模型边生成边往这儿推,先把已经出来的字显示上,
+            # 用户感觉是"立刻就翻出来了",不用等整句生成完。
+            # (同一时刻只有一个后台任务在跑,所以这些增量一定属于当前这句)
+            part, src = payload
+            self._streaming = True
+            self._last_source = src
+            self._last_translation = part
+            self.repaint()
+            o.set_status(f"{time.strftime('%H:%M:%S')} · 正在翻译…", "#8fb6ff")
+        elif kind == "ok":
             text, out, used, from_cache = payload
             self._fails = 0
             self._last_ok = time.time()
+            was_streaming = self._streaming
+            self._streaming = False
             self._last_source = text
             self._last_translation = out
             self.repaint()
@@ -1063,6 +1231,19 @@ class RealtimeSession:
             o.set_status(f"{time.strftime('%H:%M:%S')} · {tag} · "
                          f"识别 {len(text)} 字 · 范围 {x2 - x1}×{y2 - y1}",
                          "#7f8fa3")
+            # 这一句翻译完了,记进上下文,供后面几句参考
+            self._push_context(text)
+            if was_streaming:
+                self._text_stamp = time.time()
+        elif kind == "refined":
+            # 第二遍(带上下文)的结果回来了,悄悄替换掉
+            text, out, used = payload
+            if self._last_translation == out:
+                return
+            self._last_translation = out
+            self.repaint()
+            o.set_status(f"{time.strftime('%H:%M:%S')} · {engines.engine_name(used)}"
+                         f" · 已结合前文重新润色", "#6fb3a0")
         elif kind == "same":
             self._last_source = payload
             o.set_status(f"{time.strftime('%H:%M:%S')} · 画面未变化,沿用上次译文",

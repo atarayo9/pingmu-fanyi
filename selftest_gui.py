@@ -168,32 +168,75 @@ def main():
               demo.winfo_rooty() + demo.winfo_height())
     print(f"    监视区域: {region}", flush=True)
 
-    # 预检:桌面上可能有别的窗口压在被监视窗口上面,那样 OCR 读到的是别人的内容,
-    # 测试就会时好时坏。这里先把窗口抬到最前并确认真的能读到 Hello World。
-    ready = False
-    for attempt in range(5):
-        demo.attributes("-topmost", True)
-        demo.lift()
-        pump(root, 0.6)
-        try:
-            probe = core.ocr_image(core.capture_region(region), "auto",
-                                   "rapidocr", cfg)
-        except Exception:
-            probe = ""
-        if "Hello" in probe:
-            ready = True
-            break
-        print(f"    (第 {attempt + 1} 次预检没读到目标文字:{probe.strip()[:30]!r},"
-              f"把窗口抬前再试)", flush=True)
-
-    check("被监视窗口没有被别的窗口挡住", ready,
-          "读到 Hello World" if ready else
-          "桌面有窗口遮挡,测不了 —— 请关掉其它窗口后重跑")
-
     # 真实场景:开始实时翻译前主窗口会藏起来
     root.withdraw()
     pump(root, 0.6)
     check("主窗口隐藏后,被监视的窗口依然可见", demo.winfo_viewable())
+
+    # 改用「假翻译引擎」,让这个测试不依赖外网。
+    #
+    # 这一段要验证的是**实时翻译的管线**(截图 -> OCR -> 去重 -> 翻译 -> 悬浮窗):
+    # OCR 用的是真家伙、真像素;翻译换成假的,原因有两个:
+    #   1) 真实接口的能力已经由 selftest.py 覆盖了;
+    #   2) 反复跑测试会把免费接口打到限流、各引擎进入冷却,于是测试时好时坏 ——
+    #      那是外部服务的问题,不该冒充功能失败。
+    class _StubEngine:
+        id = "stub"
+        name = "测试引擎"
+        free = True
+        needs_key = False
+        key_url = ""
+        key_help = ""
+        note = ""
+        params = ()
+        chunk = 3500
+        supports_context = True
+        supports_stream = False
+
+        def runner(self, text, cfg, target, **kw):
+            return "【译文】" + (text or "").replace("\n", " ")[:30]
+
+    engines.ENGINES["stub"] = _StubEngine()
+    cfg["engine"] = "stub"
+    print("    翻译已换成测试引擎(不依赖外网),OCR 仍是真实的", flush=True)
+
+    # 预检放在**紧挨着启动会话之前**:桌面上别的窗口随时可能盖到被监视窗口
+    # 上面,那样 OCR 读到的是别人的内容,测试就时好时坏。
+    ready = False
+    probe = ""
+    for attempt in range(6):
+        demo.attributes("-topmost", True)
+        demo.lift()
+        pump(root, 0.7)
+        try:
+            probe = core.ocr_image(core.capture_region(region), "auto",
+                                   "rapidocr", cfg)
+        except Exception as e:
+            probe = f"<{type(e).__name__}>"
+        if "Hello" in probe:
+            ready = True
+            break
+        print(f"    (第 {attempt + 1} 次预检读到的是 {probe.strip()[:30]!r},"
+              f"把窗口抬前再试)", flush=True)
+
+    check("被监视窗口没有被别的窗口挡住", ready,
+          "读到 Hello World" if ready else
+          f"桌面有窗口遮挡(读到 {probe.strip()[:24]!r}),请关掉其它窗口后重跑")
+
+    # 会话这一段改用「预检时抓到的真实画面」喂进去,不再每一帧都去截屏。
+    # 原因:只要桌面上有任何窗口飘过被监视区域,实时翻译就会读到别人的内容,
+    # 测试时好时坏 —— 那是测试环境的问题,不该冒充功能失败。
+    # 真实截屏能力已经由上面的预检验证过了(那一步读的就是屏幕)。
+    frozen = core.capture_region(region)
+    _orig_capture = core.capture_region
+    realtime.core.capture_region = lambda _r: frozen
+    try:
+        _fz = core.ocr_image(frozen, "auto", "rapidocr", cfg)
+    except Exception as e:
+        _fz = f"<{type(e).__name__}>"
+    check("固定下来的这一帧确实含目标文字", "Hello" in _fz, repr(_fz[:36]))
+    print(f"    已固定一帧真实画面供会话使用:{frozen.size} "
+          f"内容={_fz.replace(chr(10), ' / ')[:30]!r}", flush=True)
 
     exited = {"called": False}
     session = realtime.RealtimeSession(
@@ -307,6 +350,7 @@ def main():
     got = ""
     src = ""
     deadline = time.time() + seconds
+    _dbg = time.time()
     while time.time() < deadline:
         pump(root, 0.3)
         try:
@@ -314,6 +358,13 @@ def main():
             src = session._last_source
         except Exception:
             break
+        if time.time() - _dbg > 2:
+            _dbg = time.time()
+            print(f"      [等待中] running={session.running} busy={session._busy} "
+                  f"fails={session._fails} src={src[:20]!r} "
+                  f"译文={session._last_translation[:20]!r} "
+                  f"悬浮窗={got[:16]!r} "
+                  f"状态={session.overlay.status.cget('text')[:36]!r}", flush=True)
         if has_cjk(got) and src:
             break
     print(f"    识别到的原文: {src[:60]!r}", flush=True)
@@ -345,8 +396,11 @@ def main():
           session.overlay.stop_btn.cget("text"))
 
     # ---- 外观:透明度/颜色/字号/位置 ----
-    session.overlay.attributes("-alpha", 0.5)
-    pump(root, 0.2)
+    # 走真实机制(改配置 -> apply_style)。直接 attributes("-alpha", ...) 去改窗口,
+    # 会被实时翻译循环按配置恢复掉 —— 那是程序在正常工作,不是 bug。
+    session.cfg["rt_opacity"] = 0.5
+    session.overlay.apply_style()
+    pump(root, 0.4)
     check("透明度可改",
           abs(float(session.overlay.attributes("-alpha")) - 0.5) < 0.05,
           str(session.overlay.attributes("-alpha")))
@@ -381,9 +435,68 @@ def main():
     pump(root, 0.2)
     check("鼠标穿透可关闭", not session.overlay.click_through)
 
+    # ---- 流式:大模型边生成边推过来的增量要立刻显示 ----
+    session._handle("delta", ("你好，世", "Yes, sir."))
+    pump(root, 0.2)
+    check("流式增量直接显示到悬浮窗",
+          session.overlay.text.get("1.0", "end").strip() == "你好，世",
+          repr(session.overlay.text.get("1.0", "end").strip()))
+
+    # ---- 上下文缓冲(第二遍翻译的依据)----
+    session._reset_context()
+    for ln in ("line one", "line two", "line three", "line four", "line five"):
+        session._push_context(ln)
+    session.cfg["rt_context_lines"] = 3
+    ctx = session._context_text()
+    check("上下文只保留最近几行",
+          ctx.count("\n") == 2 and "line five" in ctx and "line one" not in ctx,
+          repr(ctx))
+    session._push_context("line five")
+    check("重复的行不会重复进上下文",
+          session._context_text().count("line five") == 1)
+    session._reset_context()
+    check("重置后上下文为空", session._context_text() == "")
+
+    # ---- 第二遍重译:必须等文本稳定,而且只做一次 ----
+    session.cfg["engine"] = "deepseek"          # 只有大模型引擎读得懂前文
+    session.cfg["rt_context"] = True
+    session.cfg["rt_settle_ms"] = 500
+    session._busy = False
+    session._ctx_busy = False
+    session._push_context("Commander, the scouts have returned.")
+
+    fired = {}
+    _orig_refine = session._worker_context
+    session._worker_context = lambda t, c: fired.update(text=t, ctx=c)
+
+    session._ctx_pending = "Yes, sir."
+    session._text_stamp = time.time()           # 刚变化,还没稳定
+    session._maybe_refine()
+    pump(root, 0.3)
+    check("文本刚变化时不会立刻重译", not fired and session._ctx_pending == "Yes, sir.")
+
+    session._text_stamp = time.time() - 3       # 已经稳定很久
+    session._maybe_refine()
+    pump(root, 0.5)
+    check("文本稳定后会带前文重译一次",
+          fired.get("text") == "Yes, sir."
+          and "Commander" in (fired.get("ctx") or ""), str(fired)[:70])
+    check("重译只做一次(待重译标记已清)",
+          session._ctx_pending is None)
+    session._worker_context = _orig_refine
+
+    session.cfg["engine"] = "mymemory"
+    session._ctx_pending = "再来一句"
+    session._text_stamp = time.time() - 3
+    fired.clear()
+    session._maybe_refine()
+    pump(root, 0.3)
+    check("引擎不支持上下文时不做第二遍", not fired)
+
     # ---- 退出实时翻译:整个模式结束并回调 ----
     session.exit_realtime()
     pump(root, 0.6)
+    realtime.core.capture_region = _orig_capture     # 还原,后面的检查还用真的
     check("「退出实时翻译」后悬浮窗关闭", session.overlay is None)
     check("「退出实时翻译」后模式结束",
           not session.active and not session.running)

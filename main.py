@@ -395,24 +395,33 @@ class App:
         self.events.put(("probe", (None, None)))
 
     def _probe_engine(self, engine_id, timeout=4):
-        """真连一次接口,看这个引擎通不通。超时设短一点,免得启动卡太久。"""
+        """真连一次接口,看这个引擎通不通。超时设短一点,免得启动卡太久。
+
+        探测失败就顺手把它标记成「冷却」。这样用户第一次点翻译时,不会再在
+        已知不通的引擎上白等一轮超时 —— 国内 Google 连不上、免费接口限流是
+        常态,一路试过去能拖到几十秒,而且全程界面都是"正在识别…"。
+        """
         spec = engines.get_engine(engine_id)
         if spec is None:
             return False
+        ok = False
         try:
-            return bool(spec.runner("hello", self.cfg, "zh-CN",
-                                    timeout=timeout).strip())
+            ok = bool(spec.runner("hello", self.cfg, "zh-CN",
+                                  timeout=timeout).strip())
         except TypeError:
             # 万一某个引擎的 runner 不接受 timeout
             try:
-                return bool(spec.runner("hello", self.cfg, "zh-CN").strip())
+                ok = bool(spec.runner("hello", self.cfg, "zh-CN").strip())
             except Exception as e:
                 logging.getLogger("fanyi").info("引擎 %s 探测失败: %s",
                                                 engine_id, e)
-                return False
         except Exception as e:
             logging.getLogger("fanyi").info("引擎 %s 探测失败: %s", engine_id, e)
-            return False
+        if ok:
+            engines.mark_good(engine_id)
+        else:
+            engines.mark_down(engine_id)
+        return ok
 
     # ------------------------------------------------------------ 截图翻译
 

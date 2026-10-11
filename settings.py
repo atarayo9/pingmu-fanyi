@@ -435,6 +435,30 @@ class SettingsWindow(tk.Toplevel):
             if tip:
                 hint(page, tip, wraplength=560)
 
+        section_title(page, "上下文与速度")
+        self.rt_context_var = tk.BooleanVar(
+            value=bool(self.cfg.get("rt_context", True)))
+        ttk.Checkbutton(page, text="联系上下文翻译(看对话/长文时更连贯)",
+                        variable=self.rt_context_var,
+                        style="Card.TCheckbutton").pack(anchor="w")
+        self.rt_stream_var = tk.BooleanVar(
+            value=bool(self.cfg.get("rt_stream", True)))
+        ttk.Checkbutton(page, text="逐字显示(译文边生成边出现,感觉更快)",
+                        variable=self.rt_stream_var,
+                        style="Card.TCheckbutton").pack(anchor="w", pady=(6, 0))
+        _spec = engines.get_engine(self.cfg.get("engine", ""))
+        if _spec and _spec.supports_context:
+            _tip, _color = (f"{_spec.name} 支持上下文,这两个开关直接生效。",
+                            MUTED)
+        else:
+            _tip = (f"{(_spec.name if _spec else '当前引擎')} 读不懂前文,"
+                    f"这两个开关对它无效 —— 想用请把引擎换成 DeepSeek "
+                    f"或 OpenAI 兼容接口。")
+            _color = WARN
+        tk.Label(page, text=_tip, bg=CARD, fg=_color, anchor="w",
+                 font=(FONT, 8), wraplength=560, justify="left").pack(
+            fill="x", pady=(2, 0))
+
         section_title(page, "显示选项")
         self.rt_region_var = tk.BooleanVar(
             value=bool(self.cfg.get("rt_show_region", True)))
@@ -570,6 +594,8 @@ class SettingsWindow(tk.Toplevel):
                              ("rt_font_size", "rt_overlay_w")
                              else round(float(var.get()), 3))
         self.cfg["rt_show_region"] = bool(self.rt_region_var.get())
+        self.cfg["rt_context"] = bool(self.rt_context_var.get())
+        self.cfg["rt_stream"] = bool(self.rt_stream_var.get())
         self.cfg["rt_show_source"] = bool(self.rt_source_var.get())
         self.cfg["rt_topmost"] = bool(self.rt_topmost_var.get())
         self.cfg["rt_merge_lines"] = bool(self.rt_merge_var.get())

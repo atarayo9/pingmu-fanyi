@@ -67,10 +67,12 @@ class EngineSpec:
     """一个翻译引擎的完整描述。"""
 
     __slots__ = ("id", "name", "free", "needs_key", "key_url", "key_help",
-                 "note", "params", "chunk", "runner")
+                 "note", "params", "chunk", "runner",
+                 "supports_context", "supports_stream")
 
     def __init__(self, id, name, free, needs_key, runner, key_url="",
-                 key_help="", note="", params=(), chunk=3500):
+                 key_help="", note="", params=(), chunk=3500,
+                 supports_context=False, supports_stream=False):
         self.id = id
         self.name = name
         self.free = free
@@ -81,6 +83,9 @@ class EngineSpec:
         self.params = tuple(params)
         self.chunk = chunk
         self.runner = runner
+        # 只有大模型引擎能读懂"前文",也只有它能边生成边吐字
+        self.supports_context = supports_context
+        self.supports_stream = supports_stream
 
     @property
     def badge(self):
@@ -449,9 +454,35 @@ def run_deepl(text, cfg, target, timeout=20):
     return out
 
 
+def _chat_messages(text, target, context=None):
+    """拼一段给大模型的消息。带上下文时,前文只用来理解,不翻译。"""
+    if context:
+        system = (f"你是字幕/对话翻译。把【待翻译】的内容翻译成"
+                  f"{target_name(target)}。\n"
+                  "【前文】是已经出现过的内容,只用来帮你判断指代、专有名词、"
+                  "称呼和语气,不要翻译它,也不要复述它。\n"
+                  "只输出【待翻译】的译文本身,不要解释、不要加引号、"
+                  "不要加任何前缀或标注。")
+        user = f"【前文】\n{context}\n\n【待翻译】\n{text}"
+    else:
+        system = (f"你是一名专业翻译。把用户提供的文本翻译成"
+                  f"{target_name(target)},"
+                  "忠实原意、保留换行与语气,只输出译文本身,"
+                  "不要解释、不要加引号、不要加任何前缀。")
+        user = text
+    return [{"role": "system", "content": system},
+            {"role": "user", "content": user}]
+
+
 def _openai_compat(text, cfg, target, base_key, key_key, model_key,
-                   default_base, default_model, timeout=60):
-    """OpenAI 兼容 /chat/completions,DeepSeek 与自定义接口共用。"""
+                   default_base, default_model, timeout=60,
+                   context=None, stream=False, on_delta=None):
+    """OpenAI 兼容 /chat/completions。DeepSeek 与自定义接口共用。
+
+    context   —— 前文(只作理解用,不翻译),让前后句的指代和术语对得上;
+    stream    —— 边生成边回调 on_delta(累积到当前的文本),观感上"立刻出字";
+    on_delta  —— 每收到一小段就调一次,传的是**累积后的完整译文**。
+    """
     base = (_get(cfg, base_key, default_base) or "").strip().rstrip("/")
     key = (_get(cfg, key_key) or "").strip()
     model = (_get(cfg, model_key, default_model) or "").strip() or default_model
@@ -465,16 +496,18 @@ def _openai_compat(text, cfg, target, base_key, key_key, model_key,
         url = base
     else:
         url = base + "/v1/chat/completions"
-    system = (f"你是一名专业翻译。把用户提供的文本翻译成{target_name(target)},"
-              "忠实原意、保留换行与语气,只输出译文本身,"
-              "不要解释、不要加引号、不要加任何前缀。")
-    payload = {"model": model, "temperature": 0.2, "stream": False,
-               "messages": [{"role": "system", "content": system},
-                            {"role": "user", "content": text}]}
-    r = requests.post(url, json=payload, timeout=timeout,
-                      headers={"Authorization": f"Bearer {key}",
-                               "Content-Type": "application/json",
-                               "User-Agent": USER_AGENT})
+
+    use_stream = bool(stream and on_delta)
+    payload = {"model": model, "temperature": 0.2, "stream": use_stream,
+               "messages": _chat_messages(text, target, context)}
+    headers = {"Authorization": f"Bearer {key}",
+               "Content-Type": "application/json",
+               "User-Agent": USER_AGENT}
+
+    if use_stream:
+        return _openai_stream(url, payload, headers, timeout, on_delta)
+
+    r = requests.post(url, json=payload, timeout=timeout, headers=headers)
     if r.status_code in (401, 403):
         raise TranslateError("API Key 无效或无权限,请检查后重新填写")
     if r.status_code == 404:
@@ -492,16 +525,71 @@ def _openai_compat(text, cfg, target, base_key, key_key, model_key,
     return out
 
 
-def run_deepseek(text, cfg, target, timeout=60):
+def _openai_stream(url, payload, headers, timeout, on_delta):
+    """流式读 SSE:每来一小段就回调一次,让人感觉"立刻就翻出来了"。"""
+    import json as _json
+    acc = []
+    try:
+        with requests.post(url, json=payload, timeout=timeout, headers=headers,
+                           stream=True) as r:
+            if r.status_code in (401, 403):
+                raise TranslateError("API Key 无效或无权限,请检查后重新填写")
+            if r.status_code == 404:
+                raise TranslateError(f"接口地址或模型名不对(404): {url}")
+            if r.status_code == 429:
+                raise TranslateError("请求过于频繁或额度不足(429)")
+            if r.status_code >= 400:
+                raise TranslateError(f"接口返回 {r.status_code}: "
+                                     f"{r.text[:200]}")
+            r.encoding = "utf-8"
+            for line in r.iter_lines(decode_unicode=True):
+                if not line:
+                    continue
+                if line.startswith("data:"):
+                    line = line[5:].strip()
+                if line == "[DONE]":
+                    break
+                try:
+                    chunk = _json.loads(line)
+                except ValueError:
+                    continue
+                try:
+                    delta = chunk["choices"][0].get("delta") or {}
+                    piece = delta.get("content") or ""
+                except (KeyError, IndexError, TypeError):
+                    piece = ""
+                if piece:
+                    acc.append(piece)
+                    try:
+                        on_delta("".join(acc))
+                    except Exception:
+                        pass
+    except TranslateError:
+        raise
+    except Exception as e:
+        # 流式失败(有些兼容服务不支持):已经有内容就先用着,否则整体报错
+        if not acc:
+            raise TranslateError(f"流式请求失败: {type(e).__name__}: {e}")
+    out = "".join(acc).strip()
+    if not out:
+        raise TranslateError("接口返回空译文")
+    return out
+
+
+def run_deepseek(text, cfg, target, timeout=60, context=None, stream=False,
+                 on_delta=None):
     return _openai_compat(text, cfg, target, "deepseek_base", "deepseek_key",
                           "deepseek_model", "https://api.deepseek.com",
-                          "deepseek-chat", timeout)
+                          "deepseek-chat", timeout,
+                          context=context, stream=stream, on_delta=on_delta)
 
 
-def run_openai(text, cfg, target, timeout=60):
+def run_openai(text, cfg, target, timeout=60, context=None, stream=False,
+               on_delta=None):
     return _openai_compat(text, cfg, target, "openai_base", "openai_key",
                           "openai_model", "https://api.openai.com",
-                          "gpt-4o-mini", timeout)
+                          "gpt-4o-mini", timeout,
+                          context=context, stream=stream, on_delta=on_delta)
 
 
 # ---------------------------------------------------------------- 注册表
@@ -556,6 +644,7 @@ _register(EngineSpec(
 _register(EngineSpec(
     id="deepseek", name="DeepSeek", free=False, needs_key=True,
     runner=run_deepseek, chunk=3000,
+    supports_context=True, supports_stream=True,
     key_url="https://platform.deepseek.com/api_keys",
     key_help="登录 DeepSeek 开放平台 → API Keys → 创建,复制以 sk- 开头的 Key。国内可直连,按量计费。",
     note="大模型翻译,译文自然、上下文好,适合整段文字。",
@@ -575,6 +664,7 @@ _register(EngineSpec(
 _register(EngineSpec(
     id="openai", name="OpenAI 兼容接口", free=False, needs_key=True,
     runner=run_openai, chunk=3000,
+    supports_context=True, supports_stream=True,
     key_url="https://platform.openai.com/api-keys",
     key_help="OpenAI 官方在 platform.openai.com 申请;也可换成任意兼容服务(硅基流动 / Kimi / 通义 / 本地 Ollama 等),只改「接口地址」即可。",
     note="通用适配器:任何 OpenAI 兼容的 /v1/chat/completions 服务都能接。",
@@ -648,7 +738,7 @@ _engine_down = {}
 _engine_fails = {}
 _engine_good = {}          # 本会话成功过的引擎:最近成功的排前面
 _ENGINE_COOLDOWN = 120
-_ENGINE_COOLDOWN_MAX = 1800
+_ENGINE_COOLDOWN_MAX = 900
 
 
 def _engine_ok(engine_id):
@@ -696,8 +786,30 @@ def _fallback_order(preferred, cfg):
     return proven + fresh_free + fresh_paid
 
 
-def translate(text, cfg, engine=None, allow_fallback=True):
+def _run_engine(s, text, cfg, target, context=None, on_delta=None):
+    """按引擎的分块大小调用它;能读前文就带上,能流式就流式。"""
+    chunks = _chunk_text(text, s.chunk)
+    # 只有在「整段一次发完」时流式才有意义,分块时逐块回调会把译文搅乱
+    use_stream = bool(on_delta) and s.supports_stream and len(chunks) == 1
+    parts = []
+    for ch in chunks:
+        kw = {}
+        if context and s.supports_context:
+            kw["context"] = context
+        if use_stream:
+            kw["stream"] = True
+            kw["on_delta"] = on_delta
+        parts.append(s.runner(ch, cfg, target, **kw))
+    return "".join(parts)
+
+
+def translate(text, cfg, engine=None, allow_fallback=True,
+              context=None, on_delta=None):
     """翻译文本,返回 (译文, 实际使用的引擎 id)。
+
+    context  —— 前文,给大模型当参考(只支持 supports_context 的引擎);
+    on_delta —— 流式回调,每生成一小段就收到一次累积译文(只支持
+                supports_stream 的引擎)。两者对不支持的引擎自动忽略。
 
     首选引擎失败会按 _fallback_order 兜底;缺 Key 会抛 MissingKeyError,
     界面据此向用户索要 Key(而不是静默换引擎)。
@@ -729,18 +841,20 @@ def translate(text, cfg, engine=None, allow_fallback=True):
 
     errors = []
     echoed = None       # 有引擎把原文原样退回来时的兜底结果
-    for eng in order:
+    for idx, eng in enumerate(order):
         s = ENGINES.get(eng)
         if s is None:
             continue
         if missing_params(eng, cfg):
             continue
-        if not _engine_ok(eng):
+        # 冷却只用来跳过**兜底**引擎(免得每次都白等 Google 超时)。
+        # 用户自己选的那个引擎永远要试 —— 不然一旦网络抖一下进了冷却,
+        # 用户点翻译只会看到「暂不可用」,还以为程序坏了。
+        if idx > 0 and not _engine_ok(eng):
             errors.append(f"{s.name}: 暂不可用(冷却中)")
             continue
         try:
-            out = _run_chunks(text, lambda c, _s=s: _s.runner(c, cfg, target),
-                              s.chunk)
+            out = _run_engine(s, text, cfg, target, context, on_delta)
             if not (out and out.strip()):
                 errors.append(f"{s.name}: 返回空译文")
                 mark_down(eng)

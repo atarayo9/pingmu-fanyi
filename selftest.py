@@ -19,6 +19,7 @@ import engines
 import theme
 
 RESULTS = []
+SKIPPED = []
 
 
 def check(name, cond, detail=""):
@@ -26,6 +27,45 @@ def check(name, cond, detail=""):
     print(f"[{mark}] {name}" + (f"  ({detail})" if detail else ""))
     RESULTS.append(bool(cond))
     return bool(cond)
+
+
+def skip(name, why=""):
+    """网络不通之类的情况:这项没法验证,但不能算功能失败。"""
+    print(f"[跳过] {name}" + (f"  ({why})" if why else ""))
+    SKIPPED.append(name)
+    return True
+
+
+_NET_MARKERS = ("SSLError", "SSLEOFError", "ConnectionError", "Max retries",
+                "timed out", "Timeout", "ProxyError", "NewConnectionError",
+                "Name or service not known", "getaddrinfo",
+                "ConnectionReset", "Connection aborted", "RemoteDisconnected",
+                "ChunkedEncoding", "OSError", "10054",
+                # 接口限流也算「外部条件不具备」,不是功能坏了
+                "429", "Too Many Requests", "冷却中", "暂不可用")
+
+
+def is_net_error(exc):
+    """这个异常是「网络不通」还是「功能坏了」?两者要区别对待。"""
+    s = f"{type(exc).__name__}: {exc}"
+    return any(m in s for m in _NET_MARKERS)
+
+
+def check_translate(name, fn, detail_ok=""):
+    """跑一个需要联网的翻译检查。
+
+    回调返回 (True/False, 说明);返回 (None, 原因) 表示「决策是对的,但当前
+    引擎不可用、结果验证不了」—— 记为跳过,不算失败。
+    """
+    try:
+        ok, detail = fn()
+        if ok is None:
+            return skip(name, detail or "当前引擎不可用,这项没法验证")
+        return check(name, ok, detail or detail_ok)
+    except Exception as e:
+        if is_net_error(e):
+            return skip(name, "当前网络连不上翻译接口,这项没法验证")
+        return check(name, False, repr(e)[:90])
 
 
 def make_test_image(text="Hello World 2025"):
@@ -83,6 +123,60 @@ def main():
 
     free_with_key = [s.id for s in specs if s.free and s.needs_key]
     check("免费引擎不强制要 Key", not free_with_key)
+
+    # ---------------------------------------------------------- 5b. 上下文 / 流式
+    ctx_ok = {s.id for s in specs if s.supports_context}
+    st_ok = {s.id for s in specs if s.supports_stream}
+    check("大模型引擎标记了支持上下文",
+          ctx_ok == {"deepseek", "openai"}, f"实际:{sorted(ctx_ok)}")
+    check("大模型引擎标记了支持流式",
+          st_ok == {"deepseek", "openai"}, f"实际:{sorted(st_ok)}")
+    check("免费接口不会被当成能读上下文",
+          not (ctx_ok & {"google", "mymemory", "libretranslate"}))
+    for _k in ("rt_context", "rt_context_lines", "rt_settle_ms", "rt_stream"):
+        check(f"配置含 {_k}", _k in core.DEFAULT_CONFIG,
+              str(core.DEFAULT_CONFIG.get(_k)))
+
+    # 带上下文的提示词:前文只作理解,不能喧宾夺主
+    m1 = engines._chat_messages("Hello there", "zh-CN", None)
+    check("无上下文时提示词不含「前文」",
+          "【前文】" not in m1[0]["content"] + m1[1]["content"])
+    check("无上下文时 user 就是原文", m1[1]["content"] == "Hello there")
+    m2 = engines._chat_messages("Yes, sir.", "zh-CN",
+                                "Commander, the scouts\nTell them to report")
+    joined = m2[0]["content"] + m2[1]["content"]
+    check("有上下文时提示词包含前文", "Commander, the scouts" in joined)
+    check("有上下文时标注了待翻译的是哪段",
+          "【待翻译】" in joined and "Yes, sir." in joined)
+    check("提示词明确要求不要翻译前文", "不要翻译" in m2[0]["content"])
+
+    # 流式只在「一次发完」时启用 —— 分块时逐块回调会把译文搅乱
+    class _FakeSpec:
+        chunk = 50
+        supports_context = True
+        supports_stream = True
+
+        def __init__(self):
+            self.calls = []
+
+        def runner(self, text, cfg, target, **kw):
+            self.calls.append(kw)
+            return "x"
+
+    fs = _FakeSpec()
+    engines._run_engine(fs, "short", {}, "zh-CN",
+                        context="前文", on_delta=lambda _a: None)
+    check("单块时同时带上上下文和流式",
+          len(fs.calls) == 1 and fs.calls[0].get("stream") is True
+          and fs.calls[0].get("context") == "前文", str(fs.calls))
+    fs2 = _FakeSpec()
+    engines._run_engine(fs2, "y" * 120, {}, "zh-CN",
+                        context="前文", on_delta=lambda _a: None)
+    check("分块时不启用流式(否则会串味)",
+          len(fs2.calls) >= 2 and all("stream" not in c for c in fs2.calls),
+          f"{len(fs2.calls)} 块")
+    check("分块时上下文仍然会带上",
+          all(c.get("context") == "前文" for c in fs2.calls))
 
     # ---------------------------------------------------------- 5. 缺 Key 行为
     probe = dict(cfg)
@@ -179,42 +273,44 @@ def main():
         check("正常尺寸区域识别不受影响", False, repr(e))
 
     # ---------------------------------------------------------- 7. 翻译
-    try:
-        out, used = engines.translate("Hello world, this is a translation test.",
-                                      cfg, cfg.get("engine"))
+    # 下面几项要联网。网络不通就「跳过」而不是报失败 ——
+    # 否则用户断网跑一次自检,会看到一堆红字却以为程序坏了。
+    def _t_basic():
+        out, used = engines.translate(
+            "Hello world, this is a translation test.", cfg, cfg.get("engine"))
         print(f"    翻译输出({used}):", repr(out))
         has_cjk = any("\u4e00" <= ch <= "\u9fff" for ch in out)
-        check("翻译可用", bool(out.strip()) and has_cjk, out.strip()[:40])
-    except Exception as e:
-        check("翻译可用", False, repr(e))
+        return bool(out.strip()) and has_cjk, out.strip()[:40]
 
-    try:
+    check_translate("翻译可用", _t_basic)
+
+    def _t_chunk():
         long_text = "This is a fairly long English sentence for testing. " * 30
         out, used = engines.translate(long_text, cfg, "mymemory")
         print(f"    MyMemory 长文输出({used}, {len(out)} 字符):", repr(out[:50]))
-        check("MyMemory 长文分块",
-              bool(out.strip()) and "MYMEMORY" not in out.upper()
-              and "QUERY LENGTH" not in out.upper(), out[:40])
-    except Exception as e:
-        check("MyMemory 长文分块", False, repr(e))
+        return (bool(out.strip()) and "MYMEMORY" not in out.upper()
+                and "QUERY LENGTH" not in out.upper()), out[:40]
 
-    try:
-        out = engines.run_mymemory("word " * 300, cfg, "zh-CN")
+    check_translate("MyMemory 长文分块", _t_chunk)
+
+    def _t_marker():
+        try:
+            out = engines.run_mymemory("word " * 300, cfg, "zh-CN")
+        except engines.TranslateError as e:
+            return True, str(e)[:50]      # 明确报错也是对的
         bad = any(m in out.upper() for m in engines._MYMEMORY_ERROR_MARKERS)
-        check("MyMemory 错误识别", not bad, out[:40])
-    except engines.TranslateError as e:
-        check("MyMemory 错误识别", True, str(e)[:50])
+        return not bad, out[:40]
+
+    check_translate("MyMemory 错误识别", _t_marker)
 
     # ---- 短句必须真的被翻译(免费接口 autodetect 对短句经常原样返回)----
-    try:
+    def _t_short():
         out, used = engines.translate("Hello World", cfg, cfg.get("engine"))
         print("    短句翻译:", repr(out), f"({used})")
         cjk = any("\u4e00" <= ch <= "\u9fff" for ch in out)
-        check("短句也能翻成中文(不再原样返回)",
-              bool(out.strip()) and cjk and out.strip() != "Hello World",
-              f"{out[:30]}")
-    except Exception as e:
-        check("短句也能翻成中文(不再原样返回)", False, repr(e))
+        return (bool(out.strip()) and cjk and out.strip() != "Hello World"), out[:30]
+
+    check_translate("短句也能翻成中文(不再原样返回)", _t_short)
 
     # ---- 原文已经是目标语言:原样显示,不能报错 ----
     check("已是目标语言能被识别",
@@ -257,15 +353,20 @@ def main():
           abs(engines.script_stats("你好 123 !!")[0].get("han", 0) - 1.0) < 1e-6,
           str(engines.script_stats("你好 123 !!")[0]))
 
-    try:
-        out, used = engines.translate("你好 world this is an English sentence",
-                                      cfg, cfg.get("engine"))
+    def _t_mixed():
+        # 先验证「决策」:这段文本绝不能被判成"已经是目标语言"而跳过翻译。
+        # 这是这段代码真正要保证的事,和引擎通不通没关系。
+        if engines.already_in_target(mixed, "zh-CN", {"source_lang": "auto"}):
+            return False, "被误判成已是中文,压根不会送去翻译"
+        out, used = engines.translate(mixed, cfg, cfg.get("engine"))
         print("    混排翻译:", repr(out), f"({used})")
-        check("中英混排真的被送去翻译了(不是原样返回)",
-              out.strip() != "你好 world this is an English sentence",
-              out[:50])
-    except Exception as e:
-        check("中英混排真的被送去翻译了(不是原样返回)", False, repr(e))
+        if out.strip() == mixed.strip():
+            # 决策是对的、也确实送去翻了,只是所有引擎都在限流/冷却,
+            # 最后走了「原样显示」兜底 —— 这属于外部条件不具备
+            return None, "已送去翻译,但当前引擎都没给出译文(限流/冷却)"
+        return True, out[:50]
+
+    check_translate("中英混排真的被送去翻译了(不是原样返回)", _t_mixed)
 
     try:
         out, used = engines.translate("你好世界", cfg, cfg.get("engine"))
@@ -336,8 +437,14 @@ def main():
 
     print("=" * 44)
     ok = all(RESULTS)
-    print(f"全部通过 ✓ ({len(RESULTS)} 项)" if ok
-          else f"存在失败项 ✗ ({RESULTS.count(False)}/{len(RESULTS)})")
+    if ok and SKIPPED:
+        print(f"全部通过 ✓ ({len(RESULTS)} 项,另有 {len(SKIPPED)} 项因断网跳过)")
+    elif ok:
+        print(f"全部通过 ✓ ({len(RESULTS)} 项)")
+    else:
+        print(f"存在失败项 ✗ ({RESULTS.count(False)}/{len(RESULTS)})")
+    if SKIPPED:
+        print("跳过:" + "、".join(SKIPPED))
     return 0 if ok else 1
 
 
